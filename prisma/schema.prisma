@@ -1,0 +1,159 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id       String  @id @default(uuid())
+  email    String  @unique
+  password String
+  name     String?
+
+  credits             Int                  @default(100000)
+  createdAt           DateTime             @default(now())
+  agents              Agent[]
+  contents            Content[]
+  tasks               Task[]
+  tokenUsage          TokenUsage[]
+  billingTransactions BillingTransaction[]
+  creditLedgerEntries CreditLedger[]
+}
+
+model Agent {
+  id          String       @id @default(uuid())
+  name        String       @unique
+  ownerId     String
+  owner       User         @relation(fields: [ownerId], references: [id])
+  description String?
+  createdAt   DateTime     @default(now())
+  tasks       Task[]
+  tokenUsage  TokenUsage[]
+}
+
+model Task {
+  id      String  @id @default(uuid())
+  userId  String
+  user    User    @relation(fields: [userId], references: [id])
+  agentId String?
+  agent   Agent?  @relation(fields: [agentId], references: [id])
+
+  type           String
+  status         String       @default("pending")
+  payload        Json
+  idempotencyKey String?      @unique
+  billed         Boolean      @default(false)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  taskResults    TaskResult[]
+  tokenUsage     TokenUsage[]
+}
+
+// payload: { it contains various fields depending on the content type for example, for articles it may contain title, body, author, source, etc. }
+
+model Content {
+  id        String   @id @default(uuid())
+  title     String?
+  body      String   @db.Text
+  authorId  String?
+  author    User?    @relation(fields: [authorId], references: [id])
+  source    String?
+  metadata  Json?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+//source :{it can be a URL, book title, journal name, etc. depending on where the content was obtained from}
+//metadata: {it can include fields like language, word count, publication date, tags, etc. depending on the content type}
+
+model TaskResult {
+  id        String  @id @default(uuid())
+  taskId    String
+  task      Task    @relation(fields: [taskId], references: [id])
+  agentId   String?
+  type      String
+  status    String  @default("pending")
+  output    Json?
+  contentId String?
+  order     Int?
+
+  model            String?
+  promptTokens     Int?
+  completionTokens Int?
+  totalTokens      Int?
+  createdAt        DateTime     @default(now())
+  updateddAt       DateTime     @updatedAt
+  errorMessage     String?
+  tokenUsage       TokenUsage[]
+}
+
+model TokenUsage {
+  id String @id @default(uuid())
+
+  userId String
+  user   User?  @relation(fields: [userId], references: [id])
+
+  taskId String?
+  task   Task?   @relation(fields: [taskId], references: [id])
+
+  taskResultId String?
+  taskResult   TaskResult? @relation(fields: [taskResultId], references: [id])
+
+  agentId String?
+  agent   Agent?  @relation(fields: [agentId], references: [id])
+
+  provider String
+  model    String
+
+  promptTokens     Int
+  completionTokens Int
+  totalTokens      Int
+
+  totalUSD  Float?
+  createdAt DateTime @default(now())
+}
+
+model BillingTransaction {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id])
+
+  amount       Int // amount in cents (e.g. 1000 = $10)
+  currency     String @default("USD")
+  creditsAdded Int
+
+  stripeSessionId String?
+  status          String // "pending" | "completed" | "failed"
+
+  createdAt DateTime @default(now())
+}
+
+model CreditLedger {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id])
+
+  taskId String?
+  change Int // +10000 or -4500
+  reason String // "purchase" | "task_usage"
+
+  createdAt DateTime @default(now())
+}
+
+model PricingPlan {
+  id        String   @id @default(uuid())
+  name      String   @unique
+  priceUSD  Int // price in cents
+  credits   Int
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+}
