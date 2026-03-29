@@ -1,6 +1,6 @@
-import {Job, Worker} from "bullmq";
-import {agentQueue} from "./queue.js";
-import {prisma} from "./lib/prisma.js";
+import { Job, Worker } from "bullmq";
+import { agentQueue } from "./queue.js";
+import { prisma } from "./lib/prisma.js";
 import { buildAgentPrompt } from "./lib/agents/prompts/index.js";
 import { runAgent } from "./lib/agents/agentHandler.js";
 import type { ResolvedPipelineStep } from "./lib/agents/types.js";
@@ -11,227 +11,180 @@ if (!redisUrl) {
   throw new Error("REDIS_URL missing");
 }
 
-
-
 type RunStepPayload = {
   taskId: string;
   taskResultId: string;
   stepIndex: number;
-  pipeline: ResolvedPipelineStep[]; 
+  pipeline: ResolvedPipelineStep[];
 };
 
-
-
 const worker = new Worker(
-    "AgentJobs",
-    async (job:Job<RunStepPayload>)=>{
-        const {taskId,taskResultId,stepIndex, pipeline} = job.data;
-        
-        const lock = await prisma.taskResult.updateMany({
-            where: {
-                id: taskResultId,
-                status: "pending",
-            },
-            data: {
-                status: "processing",
-            },
-        });
+  "AgentJobs",
+  async (job: Job<RunStepPayload>) => {
+    const { taskId, taskResultId, stepIndex, pipeline } = job.data;
 
-            if (lock.count === 0) {
-            return;
-        }
-        
+    // 🔒 Lock
+    const lock = await prisma.taskResult.updateMany({
+      where: {
+        id: taskResultId,
+        status: "pending",
+      },
+      data: {
+        status: "processing",
+      },
+    });
 
-        let input:any = null;
-        if(stepIndex===0){
-            const task = await prisma.task.findUnique({where:{id:taskId}});
-            input = task?.payload;
-        }else{
-            const prev = await prisma.taskResult.findFirst({
-                where:{taskId,order:stepIndex},
-                orderBy:{order:"desc"}
-            });
-            input = prev?.output??prev?.contentId;
-        }
+    if (lock.count === 0) return;
 
-        const stepSpec = pipeline[stepIndex];
-        if (!stepSpec) {
-        console.error("Pipeline mismatch", {
-            taskId,
-            stepIndex,
-            pipelineLength: pipeline.length,
-        });
-        throw new Error("Invalid pipeline step");
-        }
+    
+    let input: any = null;
 
-        const promptForGemini = buildAgentPrompt({
-            stepType:stepSpec.type,
+    if (stepIndex === 0) {
+      const task = await prisma.task.findUnique({ where: { id: taskId } });
+      input = task?.payload;
+    } else {
+      const prev = await prisma.taskResult.findFirst({
+        where: { taskId, order: stepIndex }, 
+      });
+      input = prev?.output ?? prev?.contentId;
+    }
+
+    const stepSpec = pipeline[stepIndex];
+    if (!stepSpec) {
+      throw new Error("Invalid pipeline step");
+    }
+
+    const promptForGemini = buildAgentPrompt({
+      stepType: stepSpec.type,
+      agentId: stepSpec.agentId,
+      input,
+      options: stepSpec.options,
+    });
+
+    try {
+      const agentOutput = await runAgent(
+        stepSpec.agentId,
+        promptForGemini,
+        stepSpec.options
+      );
+
+      const content = await prisma.content.create({
+        data: {
+          body: agentOutput.text,
+          source: "agent",
+          metadata: {
+            type: stepSpec.type,
             agentId: stepSpec.agentId,
-            input,
-            options:stepSpec.options,
-        })
+            model: agentOutput.model,
+            usage: agentOutput.usage ?? null,
+          },
+        },
+      });
 
-        try{
-            const agentOutput = await runAgent(
-            stepSpec.agentId,
-            promptForGemini,
-            stepSpec.options
-            );
+      await prisma.taskResult.update({
+        where: { id: taskResultId },
+        data: {
+          status: "completed",
+          output: { text: agentOutput.text },
+          model: agentOutput.model,
+          promptTokens: agentOutput.usage?.promptTokens ?? null,
+          completionTokens: agentOutput.usage?.completionTokens ?? null,
+          totalTokens: agentOutput.usage?.totalTokens ?? null,
+          contentId: content.id,
+        },
+      });
+    } catch (err) {
+      const errorMessage =
+        err instanceof Error ? err.message : "Unknown error";
 
-            const content = await prisma.content.create({
-                data:{
-                    body: agentOutput.text,
-                    source: "agent",
-                    metadata: {
-                        type:stepSpec.type,
-                        agentId:stepSpec.agentId,
-                        model: agentOutput.model,
-                        usage: agentOutput.usage ?? null,
-                    },
+      await prisma.taskResult.update({
+        where: { id: taskResultId },
+        data: {
+          status: "failed",
+          errorMessage,
+        },
+      });
+
+      await prisma.task.update({
+        where: { id: taskId },
+        data: { status: "failed" },
+      });
+
+      throw err;
+    }
+
+    // 🔁 Next Step
+    const nextIndex = stepIndex + 1;
+
+    if (pipeline[nextIndex]) {
+      const nextTR = await prisma.taskResult.findFirst({
+        where: { taskId, order: nextIndex + 1 },
+      });
+
+      const nextTaskResult =
+        nextTR ??
+        (await prisma.taskResult.create({
+          data: {
+            taskId,
+            agentId: pipeline[nextIndex].agentId,
+            type: pipeline[nextIndex].type,
+            status: "pending",
+            order: nextIndex + 1,
+          },
+        }));
+
+      await agentQueue.add("run-step", {
+        taskId,
+        taskResultId: nextTaskResult.id,
+        stepIndex: nextIndex,
+        pipeline,
+      });
+
+      await worker.resume();
+    } else {
+      await prisma.task.update({
+        where: { id: taskId },
+        data: { status: "completed" },
+      });
+
+      const usageAgg = await prisma.taskResult.aggregate({
+        where: { taskId },
+        _sum: { totalTokens: true },
+      });
+
+      const totalTokensUsed = usageAgg._sum.totalTokens ?? 0;
+
+      const task = await prisma.task.findUnique({ where: { id: taskId } });
+
+      if (!task?.billed && totalTokensUsed > 0) {
+        await prisma.task.update({
+          where: { id: taskId },
+          data: {
+            billed: true,
+            user: {
+              update: {
+                credits: {
+                  decrement: totalTokensUsed,
                 },
-            });                 
+              },
+            },
+          },
+        });
+      }
+    }
+  },
+  {
+    connection: { url: redisUrl },
 
-            await prisma.taskResult.update({
-                where:{id:taskResultId},
-                data:{
-                    status:"completed",
-                    output:{
-                        text:agentOutput.text,
-                    },
-                    model: agentOutput.model,
-
-                    promptTokens: agentOutput.usage?.promptTokens ?? null,
-                    completionTokens: agentOutput.usage?.completionTokens ?? null,
-                    totalTokens: agentOutput.usage?.totalTokens ?? null,
-                    contentId:content.id,
-                }
-            })
-
-        }catch(err){
-              const errorMessage =
-                err instanceof Error ? err.message : "Unknown error";
-            await prisma.taskResult.update({
-                where: { id: taskResultId },
-                data: {
-                status: "failed",
-                errorMessage,                
-                },
-            });
-
-            await prisma.task.update({
-                where: { id: taskId },
-                data: { status: "failed" },
-            });
-
-
-           
-              
-            throw err; 
-        }
-
-        const nextIndex = stepIndex+1;
-        if(pipeline[nextIndex]){
-            const nextTR= await prisma.taskResult.findFirst({
-                where:{taskId,order:nextIndex+1}
-            });
-            if(!nextTR) {
-                const created = await prisma.taskResult.create({
-                    data:{
-                        taskId, 
-                        agentId:pipeline[nextIndex].agentId, 
-                        type:pipeline[nextIndex].type,
-                        status:"pending",
-                        order:nextIndex+1, 
-                    }
-                });
-                await agentQueue.add("run-step",{
-                    taskId,
-                    taskResultId:created.id,
-                    stepIndex: nextIndex,
-                    pipeline,
-                });
-            }else{
-                await agentQueue.add("run-step",{
-                    taskId,
-                    taskResultId:nextTR.id,
-                    stepIndex: nextIndex,
-                    pipeline,
-                });
-            }
-        }else {
-            await prisma.task.update({
-                where: { id: taskId },
-                data: { status: "completed" },
-            });
-
-            const finalResult = await prisma.taskResult.findFirst({
-                where: { taskId },
-                orderBy: { order: "desc" },
-            });
-
-            let text = "";
-            let model = null;
-            let usage = null;
-
-            if (finalResult?.contentId) {
-                const content = await prisma.content.findUnique({
-                where: { id: finalResult.contentId },
-                });
-                text = content?.body ?? "";
-            }
-
-            if (
-                finalResult?.output &&
-                typeof finalResult.output === "object" &&
-                finalResult.output !== null
-            ) {
-                const out = finalResult.output as {
-                text?: string;
-                model?: string;
-                usage?: any;
-                };
-                model = out.model ?? null;
-                usage = out.usage ?? null;
-                if (!text) text = out.text ?? "";
-            }
-
-            const usageAgg = await prisma.taskResult.aggregate({
-            where: { taskId },
-            _sum: { totalTokens: true },
-            });
-
-
-            const totalTokensUsed = usageAgg._sum.totalTokens ?? 0;
-
-            const task = await prisma.task.findUnique({ where: { id: taskId } });
-
-            if (!task?.billed && totalTokensUsed > 0) {
-            await prisma.task.update({
-                where: { id: taskId },
-                data: {
-                billed: true,
-                user: {
-                    update: {
-                    credits: {
-                        decrement: totalTokensUsed,
-                    },
-                    },
-                },
-                },
-            });
-            }
-
-
-        }
-    },
-    {connection:{url:redisUrl}},
     concurrency: 1, // avoid multiple polling loops
 
     limiter: {
       max: 5,
       duration: 1000,
     },
+
     autorun: false, 
+  }
 );
 
 await worker.run();
@@ -241,13 +194,12 @@ worker.on("drained", async () => {
   await worker.pause();
 });
 
-worker.on("completed",(job)=>{
-    console.log(`[worker] job ${job.id} completed`)
-})
+worker.on("completed", (job) => {
+  console.log(`[worker] job ${job.id} completed`);
+});
 
-worker.on("failed",(job,err)=>{
-    console.error(`[worker] job ${job?.id} failed:`,err)
-})
-  
+worker.on("failed", (job, err) => {
+  console.error(`[worker] job ${job?.id} failed:`, err);
+});
 
-console.log("[worker] started")
+console.log("[worker] started");
