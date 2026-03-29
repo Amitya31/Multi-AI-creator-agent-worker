@@ -17,7 +17,7 @@ type RunStepPayload = {
   taskId: string;
   taskResultId: string;
   stepIndex: number;
-  pipeline: ResolvedPipelineStep[]; // ✅
+  pipeline: ResolvedPipelineStep[]; 
 };
 
 
@@ -224,9 +224,22 @@ const worker = new Worker(
 
         }
     },
-    {connection:{url:redisUrl}}
+    {connection:{url:redisUrl}},
+    concurrency: 1, // avoid multiple polling loops
+
+    limiter: {
+      max: 5,
+      duration: 1000,
+    },
     autorun: false, 
 );
+
+await worker.run();
+
+worker.on("drained", async () => {
+  console.log("[worker] queue empty → pausing");
+  await worker.pause();
+});
 
 worker.on("completed",(job)=>{
     console.log(`[worker] job ${job.id} completed`)
@@ -235,5 +248,6 @@ worker.on("completed",(job)=>{
 worker.on("failed",(job,err)=>{
     console.error(`[worker] job ${job?.id} failed:`,err)
 })
+  
 
 console.log("[worker] started")
