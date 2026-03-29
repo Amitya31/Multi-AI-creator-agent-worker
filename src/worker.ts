@@ -225,6 +225,7 @@ const worker = new Worker(
         }
     },
     {connection:{url:redisUrl}}
+    autorun: false, 
 );
 
 worker.on("completed",(job)=>{
